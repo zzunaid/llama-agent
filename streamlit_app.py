@@ -1,5 +1,4 @@
 import streamlit as st
-import os
-
-# Get database URL from secrets
-DB_URL = st.secrets.get("DATABASE_URL")
+st.set_page_config(page_title="Llama Agent", layout="centered")
+st.title("✅ Streamlit is connected")
+st.write("If you can read this, deploy is wired correctly.")
