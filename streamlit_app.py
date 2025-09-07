@@ -6,9 +6,9 @@ import streamlit as st
 from scipy.stats import chisquare, chi2_contingency
 
 # ---------------- Page setup ----------------
-st.set_page_config(page_title="Cohort Compare (Demo + Time Series)", layout="wide")
-st.title("Baseline vs Current — Attribute Comparison")
-st.caption("Demo uses synthetic data so you can verify charts & insights. Swap generators with SQL when ready.")
+st.set_page_config(page_title="Cohort Compare (Two Windows • Time Series • A/B Time Series)", layout="wide")
+st.title("Cohort & Attribute Comparison")
+st.caption("Demo uses synthetic data. Swap generators with SQL when ready.")
 
 # ---------------- Defaults ----------------
 today = date.today()
@@ -19,16 +19,20 @@ base_start = base_end - timedelta(days=7)
 
 with st.sidebar:
     st.header("Mode")
-    mode = st.radio("Choose analysis mode", ["Two windows", "Time series"])
+    mode = st.radio(
+        "Choose analysis mode",
+        ["Two windows", "Time series", "Compare two time series (A vs B)"],
+        index=0
+    )
 
 # ---------------- Dummy universe ----------------
 DEVICES = ["android", "ios", "desktop"]
 COUNTRIES = ["IN", "US", "AE", "SG", "UK"]
 CHANNELS = ["ads", "seo", "social", "referral", "other"]
+ATTRS = ["device", "country", "channel"]
 
 # ---------------- Data generators (dummy) ----------------
 def generate_users(n_users: int, bias=None, id_prefix="B", start_id=1, seed_val=42):
-    """Generate synthetic users with categorical attributes."""
     rng = random.Random(seed_val)
     bias = bias or {}
 
@@ -51,7 +55,6 @@ def generate_users(n_users: int, bias=None, id_prefix="B", start_id=1, seed_val=
     return pd.DataFrame(rows, columns=["user_id","device","country","channel"])
 
 def make_overlap(df_base, overlap_rate=0.55, id_prefix="C", seed_val=42):
-    """Create a current df with some overlap vs base + shifted distributions."""
     rng = np.random.default_rng(seed_val)
     base_ids = df_base["user_id"].to_numpy() if not df_base.empty else np.array([])
     n_overlap = int(len(base_ids) * overlap_rate)
@@ -74,7 +77,6 @@ def make_overlap(df_base, overlap_rate=0.55, id_prefix="C", seed_val=42):
     )
 
 def make_dated_dummy(n, start_date, end_date, seed_val=42):
-    """Generate users with created_at between [start_date, end_date)."""
     df = generate_users(n, seed_val=seed_val)
     rng = np.random.default_rng(seed_val)
     days = max((end_date - start_date).days, 1)
@@ -86,9 +88,10 @@ def cat_dist(df, col):
     if df.empty:
         return pd.DataFrame({col: [], "count": [], "pct": []})
     s = df[col].value_counts(dropna=False)
-    total = s.sum()
-    pct = (s / total).rename("pct") if total else pd.Series([0]*len(s), index=s.index, name="pct")
-    return pd.concat([s.rename("count"), pct], axis=1).reset_index().rename(columns={"index": col})
+    total = int(s.sum())
+    pct = (s / total) if total else (s * 0.0)
+    out = pd.concat([s.rename("count"), pct.rename("pct")], axis=1).reset_index().rename(columns={"index": col})
+    return out
 
 def merge_dist(df_b, df_c, col):
     b = cat_dist(df_b, col).rename(columns={"count":"base_cnt","pct":"base_pct"})
@@ -97,8 +100,7 @@ def merge_dist(df_b, df_c, col):
     m["delta_pp"] = (m["curr_pct"] - m["base_pct"]) * 100 if "curr_pct" in m and "base_pct" in m else 0.0
     return m
 
-def chi_for(m):
-    """Safe chi-square (Pearson) for two distributions."""
+def chi_for_two_dists(m):
     if m is None or m.empty or m.shape[0] < 2:
         return 0.0, 1.0
     obs = m["curr_cnt"].to_numpy(dtype=float)
@@ -108,7 +110,7 @@ def chi_for(m):
     eps = 1e-9
     obs = obs + eps
     exp = exp + eps
-    exp = exp * (obs.sum() / exp.sum())  # scale expected to observed total
+    exp = exp * (obs.sum() / exp.sum())
     try:
         stat, p = chisquare(f_obs=obs, f_exp=exp)
         return float(stat), float(p)
@@ -116,7 +118,6 @@ def chi_for(m):
         return 0.0, 1.0
 
 def slice_periods(df, start_date, end_date, freq="W"):
-    """Split df into [(label, slice_df)] buckets by freq."""
     if df.empty:
         return []
     d = df.copy()
@@ -133,21 +134,21 @@ def slice_periods(df, start_date, end_date, freq="W"):
     return buckets
 
 def cat_dist_table(dfs_by_period, col):
-    """Wide table with counts & pcts per period for a categorical attribute."""
     frames = []
     for label, d in dfs_by_period:
         s = d[col].value_counts()
         total = int(s.sum())
         row = {("count", v): int(c) for v, c in s.items()}
-        row.update({("pct", v): (int(c) / total) if total else 0.0 for v, c in s.items()})
+        row.update({("pct", v): (int(c)/total) if total else 0.0 for v, c in s.items()})
         row[("meta","period")] = label
         frames.append(pd.Series(row))
     wide = pd.DataFrame(frames).fillna(0.0)
-    wide = wide.reindex(sorted(wide.columns, key=lambda x:(x[0], str(x[1]))), axis=1)
-    return wide.sort_values(("meta","period"))
+    if not wide.empty:
+        wide = wide.reindex(sorted(wide.columns, key=lambda x:(x[0], str(x[1]))), axis=1)
+        wide = wide.sort_values(("meta","period"))
+    return wide
 
 def chi_across_periods(dfs_by_period, col):
-    """Chi-square contingency across multiple periods."""
     values = sorted(set(v for _, d in dfs_by_period for v in d[col].dropna().unique()))
     if len(values) < 2 or len(dfs_by_period) < 2:
         return 0.0, 1.0
@@ -160,6 +161,72 @@ def chi_across_periods(dfs_by_period, col):
         return 0.0, 1.0
     stat, p, _, _ = chi2_contingency(mat)
     return float(stat), float(p)
+
+# ---------- NEW: compare A vs B time series helpers ----------
+def align_by_index(seriesA, seriesB):
+    """Align two [(label, df)] lists by period index (Period 1..N)."""
+    n = min(len(seriesA), len(seriesB))
+    return seriesA[:n], seriesB[:n], [f"P{i+1}" for i in range(n)]
+
+def per_period_compare(seriesA, seriesB, col):
+    """
+    For each aligned period i, build contingency (2 x K) for A vs B and calc chi-square.
+    Returns a DataFrame with A%/B% and delta_pp per category per period.
+    """
+    rows = []
+    for idx, ((labelA, dA), (labelB, dB)) in enumerate(zip(seriesA, seriesB), start=1):
+        cats = sorted(set(dA[col].dropna().unique()).union(set(dB[col].dropna().unique())))
+        # counts
+        cA = dA[col].value_counts()
+        cB = dB[col].value_counts()
+        totalA, totalB = int(cA.sum()), int(cB.sum())
+        # chi-square per period
+        if len(cats) >= 2 and totalA + totalB > 0:
+            mat = np.array([[int(cA.get(k,0)) for k in cats],
+                            [int(cB.get(k,0)) for k in cats]], dtype=float)
+            try:
+                stat, p, _, _ = chi2_contingency(mat)
+            except Exception:
+                stat, p = 0.0, 1.0
+        else:
+            stat, p = 0.0, 1.0
+
+        # per-category pct + delta
+        for k in cats:
+            a_pct = (int(cA.get(k,0)) / totalA) if totalA else 0.0
+            b_pct = (int(cB.get(k,0)) / totalB) if totalB else 0.0
+            rows.append({
+                "period_idx": idx,
+                "period_A": labelA,
+                "period_B": labelB,
+                "attribute": col,
+                "category": k,
+                "A_pct": a_pct,
+                "B_pct": b_pct,
+                "delta_pp": (a_pct - b_pct) * 100,
+                "chi2_p": p,
+                "chi2_stat": stat
+            })
+    return pd.DataFrame(rows)
+
+def pooled_chi_A_vs_B(seriesA, seriesB, col):
+    """Pool all periods: (2 x K) contingency over entire range."""
+    allA = pd.concat([d for _, d in seriesA], ignore_index=True) if seriesA else pd.DataFrame(columns=[col])
+    allB = pd.concat([d for _, d in seriesB], ignore_index=True) if seriesB else pd.DataFrame(columns=[col])
+    cats = sorted(set(allA[col].dropna().unique()).union(set(allB[col].dropna().unique())))
+    if len(cats) < 2:
+        return 0.0, 1.0
+    cA = allA[col].value_counts()
+    cB = allB[col].value_counts()
+    mat = np.array([[int(cA.get(k,0)) for k in cats],
+                    [int(cB.get(k,0)) for k in cats]], dtype=float)
+    if mat.sum() == 0:
+        return 0.0, 1.0
+    try:
+        stat, p, _, _ = chi2_contingency(mat)
+        return float(stat), float(p)
+    except Exception:
+        return 0.0, 1.0
 
 # ---------------- UI: Two windows ----------------
 def run_two_windows():
@@ -182,7 +249,6 @@ def run_two_windows():
     df_base = generate_users(base_size, id_prefix="B", start_id=1, seed_val=seed)
     df_curr = make_overlap(df_base, overlap_rate=0.55, id_prefix="C", seed_val=seed)
 
-    # Topline & overlap
     base_uu = df_base.user_id.nunique()
     curr_uu = df_curr.user_id.nunique()
     pct = None if base_uu == 0 else (curr_uu - base_uu) / base_uu * 100
@@ -195,24 +261,20 @@ def run_two_windows():
     c3_.metric("Retained users", f"{retained:,}")
     st.caption(f"New: {new:,} • Lost: {lost:,}")
 
-    # Per-attribute
-    ATTRS = ["device","country","channel"]
     insights = []
     for col in ATTRS:
         st.subheader(f"Attribute: {col}")
         m = merge_dist(df_base, df_curr, col)
         if m.empty or m.shape[0] < 2:
             st.write("Not enough buckets for chi-square.")
-            st.dataframe(m, use_container_width=True)
-            continue
-        stat, p = chi_for(m)
+            st.dataframe(m, use_container_width=True); continue
+        stat, p = chi_for_two_dists(m)
         st.write(f"Chi-square p-value: **{p:.4g}**  (stat={stat:.2f})")
         st.dataframe(m.sort_values("delta_pp", key=lambda s: s.abs(), ascending=False), use_container_width=True)
         top = m.sort_values("delta_pp", key=lambda s: s.abs(), ascending=False).head(5)[[col,"delta_pp"]]
         if not top.empty: st.bar_chart(top.set_index(col))
         idx = int(np.nanargmax(np.abs(m["delta_pp"].to_numpy())))
-        row = m.iloc[idx]
-        insights.append((col, row[col], float(row["delta_pp"]), p))
+        row = m.iloc[idx]; insights.append((col, row[col], float(row["delta_pp"]), p))
 
     st.subheader("Auto-summary")
     if insights:
@@ -245,7 +307,6 @@ def run_time_series():
 
     dfs_by_period = slice_periods(df_all, overall_start, overall_end, freq=freq)
 
-    # volume trend
     vol = pd.DataFrame({
         "period": [lbl for lbl, _ in dfs_by_period],
         "users":  [d.user_id.nunique() for _, d in dfs_by_period]
@@ -255,7 +316,6 @@ def run_time_series():
     if not vol.empty:
         st.line_chart(vol.set_index("period"))
 
-    ATTRS = ["device","country","channel"]
     for col in ATTRS:
         st.subheader(f"Attribute over time: {col}")
         wide = cat_dist_table(dfs_by_period, col)
@@ -263,17 +323,15 @@ def run_time_series():
         st.write(f"Chi-square across periods p-value: **{p:.4g}**  (stat={stat:.2f})")
 
         pct_cols = [c for c in wide.columns if c[0] == "pct"]
-        pct_view = wide[[("meta","period")] + pct_cols] if pct_cols else pd.DataFrame()
+        pct_view = wide[[("meta","period")] + pct_cols] if not wide.empty and pct_cols else pd.DataFrame()
         st.dataframe(pct_view, use_container_width=True)
-
         if not pct_view.empty:
             avg_share = pct_view[pct_cols].mean().sort_values(ascending=False)
             top_k = list(avg_share.head(5).index)
             chart_df = pct_view.set_index(("meta","period"))[top_k]
-            chart_df.columns = [c[1] for c in chart_df.columns]  # flatten
+            chart_df.columns = [c[1] for c in chart_df.columns]
             st.line_chart(chart_df)
 
-        # last vs previous period deltas
         if len(dfs_by_period) >= 2:
             last_label, last_df = dfs_by_period[-1]
             prev_label, prev_df = dfs_by_period[-2]
@@ -285,10 +343,122 @@ def run_time_series():
             st.dataframe(delta.sort_values("delta_pp", key=lambda s: s.abs(), ascending=False),
                          use_container_width=True)
 
+# ---------------- UI: Compare two time series (A vs B) ----------------
+def run_compare_two_ts():
+    with st.sidebar:
+        st.header("A vs B time series")
+        a_start = st.date_input("A: start", value=base_start, key="a_start")
+        a_end   = st.date_input("A: end (exclusive)", value=base_end, key="a_end")
+        b_start = st.date_input("B: start", value=curr_start, key="b_start")
+        b_end   = st.date_input("B: end (exclusive)", value=curr_end, key="b_end")
+        freq = st.selectbox("Granularity", ["D","W","M"], index=1, key="ab_freq")
+        align = st.selectbox("Align periods by", ["Index (P1..Pn)","Calendar"], index=0,
+                             help="Index: compares A-P1 vs B-P1, etc. Calendar: compares overlapping calendar buckets.")
+        seed = st.number_input("Random seed", value=42, step=1, key="seed_ab")
+        run_ab = st.button("Run A vs B", key="run_ab")
+
+    if not run_ab:
+        st.info("Set two ranges and click **Run A vs B**.")
+        return
+
+    random.seed(seed); np.random.seed(seed)
+
+    # Create synthetic dated datasets (replace with single SQL pull each later)
+    nA = 3000 + max((a_end - a_start).days, 1) * 60
+    nB = 3000 + max((b_end - b_start).days, 1) * 60
+    dfA = make_dated_dummy(nA, a_start, a_end, seed_val=seed)
+    dfB = make_dated_dummy(nB, b_start, b_end, seed_val=seed + 7)
+
+    # Build period buckets
+    seriesA = slice_periods(dfA, a_start, a_end, freq=freq)
+    seriesB = slice_periods(dfB, b_start, b_end, freq=freq)
+
+    # Align periods
+    if align.startswith("Index"):
+        seriesA, seriesB, labels = align_by_index(seriesA, seriesB)
+        labA = [la for la,_ in seriesA]; labB = [lb for lb,_ in seriesB]
+        st.caption(f"Aligned by index. A periods: {len(seriesA)}, B periods: {len(seriesB)}.")
+    else:
+        # Calendar align: match by identical label strings
+        mapA = {la: d for la, d in seriesA}
+        mapB = {lb: d for lb, d in seriesB}
+        labels = [lab for lab in mapA.keys() if lab in mapB]
+        seriesA = [(lab, mapA[lab]) for lab in labels]
+        seriesB = [(lab, mapB[lab]) for lab in labels]
+        st.caption(f"Aligned by calendar labels. Matched periods: {len(labels)}.")
+
+    if not seriesA or not seriesB:
+        st.warning("No overlapping/alignable periods. Try a different alignment or frequency.")
+        return
+
+    # Topline: users per period (A vs B)
+    vol = pd.DataFrame({
+        "period": labels,
+        "A_users": [d.user_id.nunique() for _, d in seriesA],
+        "B_users": [d.user_id.nunique() for _, d in seriesB],
+    })
+    st.subheader("Topline users per period (A vs B)")
+    st.dataframe(vol, use_container_width=True)
+    st.line_chart(vol.set_index("period"))
+
+    # Per-attribute comparison
+    for col in ATTRS:
+        st.subheader(f"A vs B over time: {col}")
+
+        # Per-period chi-square & deltas
+        comp = per_period_compare(seriesA, seriesB, col)
+        if comp.empty:
+            st.write("No data for this attribute."); continue
+
+        # Show last period’s biggest differences
+        last_idx = comp["period_idx"].max()
+        last_delta = comp.loc[comp["period_idx"] == last_idx].copy()
+        last_delta = last_delta.sort_values("delta_pp", key=lambda s: s.abs(), ascending=False)
+
+        # Trend chart for top categories (by average |delta|)
+        avg_gap = comp.groupby("category")["delta_pp"].apply(lambda s: np.mean(np.abs(s))).sort_values(ascending=False)
+        top_cats = list(avg_gap.head(5).index)
+
+        # Build a wide table: period x (A_pct,B_pct) for top cats
+        wide_rows = []
+        for i, ( (labA, _), (labB, _) ) in enumerate(zip(seriesA, seriesB), start=1):
+            row = {"period": labels[i-1], "chi2_p": float(comp[comp.period_idx==i]["chi2_p"].iloc[0])}
+            for k in top_cats:
+                a_pct = comp[(comp.period_idx==i) & (comp.category==k)]["A_pct"]
+                b_pct = comp[(comp.period_idx==i) & (comp.category==k)]["B_pct"]
+                row[f"{k}_A"] = float(a_pct.iloc[0]) if len(a_pct) else 0.0
+                row[f"{k}_B"] = float(b_pct.iloc[0]) if len(b_pct) else 0.0
+            wide_rows.append(row)
+        wide = pd.DataFrame(wide_rows)
+
+        # Plot each top category’s A vs B trend
+        if not wide.empty:
+            for k in top_cats:
+                sub = wide[["period", f"{k}_A", f"{k}_B"]].set_index("period").rename(
+                    columns={f"{k}_A": f"{k} (A)", f"{k}_B": f"{k} (B)"}
+                )
+                st.line_chart(sub)
+
+        # Period-by-period stats view + last-period deltas
+        st.markdown("**Per-period chi-square (A vs B)**")
+        per_p = comp[["period_idx","period_A","period_B","chi2_p","chi2_stat"]].drop_duplicates().reset_index(drop=True)
+        per_p["period"] = labels[:len(per_p)]
+        per_p = per_p[["period","chi2_stat","chi2_p","period_A","period_B"]]
+        st.dataframe(per_p, use_container_width=True)
+
+        st.markdown("**Last period — top category gaps (A − B)**")
+        st.dataframe(last_delta[["category","A_pct","B_pct","delta_pp"]], use_container_width=True)
+
+        # Overall pooled significance across full ranges
+        stat_all, p_all = pooled_chi_A_vs_B(seriesA, seriesB, col)
+        st.write(f"Pooled chi-square across full range: **p={p_all:.4g}** (stat={stat_all:.2f})")
+
 # ---------------- Router ----------------
 if mode == "Two windows":
     run_two_windows()
-else:
+elif mode == "Time series":
     run_time_series()
+else:
+    run_compare_two_ts()
 
-st.caption("Tip: Replace the dummy generators with SQL queries to go live.")
+st.caption("Tip: To go live, replace dummy generators with SQL queries in each mode.")
